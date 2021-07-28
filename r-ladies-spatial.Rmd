@@ -1,0 +1,337 @@
+---
+title: "R-Ladies Nairobi Meetup: Make Web-ready Maps"
+author: "Asmae Toumi"
+date: "7/28/2021"
+output: html_document
+runtime: shiny
+---
+
+## Introduction to spatial
+
+-   The `sf` package stands for Simple Features. Simple Features is a "hierarchical data model that represents a wide range of geometry types" (Lovelace, 2021).
+
+![Simple Features classes](sf-classes.png)
+
+-   The **sf** package in R provides a set of tools for working with the simple feature objects listed above.
+
+-   Simple feature objects in R are stored in a data frame, with geographic data occupying a special column, usually named 'geom' or 'geometry'. **This is huge, because we can treat spatial objects as regular data frames!** We can also think of **sf** as "[**s**]{.ul}patial data [**f**]{.ul}rame".
+
+-   Advantages of simple features and the **sf** package (Lovelace 2021):
+
+    -   Fast reading and writing of data
+
+    -   Enhanced plotting performance
+
+    -   **sf** objects can be treated as data frames in most operations
+
+    -   **sf** functions can be combined using `%>%` operator
+
+    -   **sf** function names are relatively consistent and intuitive (all begin with `st_*`)
+
+Due to these advantages, the **sf** package is now supported in many popular packages like **tmap** (ggplot2 but for maps) and **tidycensus** (US Census data). Many packages still use the **sp** package - **sf**'s predecessor - which has objects of class `Spatial`. There are helpful functions to switch between `Spatial` and `sf` classes depending on which one the package(s) you use support.
+
+## Packages needed
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = F, warning = F)
+```
+
+```{r libraries}
+library(tidyverse) # cleaning, wrangling
+library(janitor) # cleaning
+library(sf) # spatial manipulation
+library(rKenyaCensus) # kenya shapefiles and census
+library(r2d3maps) # D3 maps
+library(shiny) # interactive web apps
+library(shinycssloaders) # loading symbol for app
+library(leaflet) # leaflet maps
+library(RColorBrewer) # color palettes
+library(htmltools) # HTML generation and tools
+```
+
+## Data
+
+We'll be using the **rKenyaCensus** package by Shelmith Kariuki to obtain Kenyan county shapefiles along with rich, county-level demographic, social, and economic Census data. For a list of all the data contained in this package, you can run `data("DataCatalogue")`.
+
+```{r}
+class(rKenyaCensus::KenyaCounties_SHP)
+```
+
+We can easily coerce this into an `sf` object using the `st_as_sf()` function from the **sf** package:
+
+```{r}
+shp <- st_as_sf(rKenyaCensus::KenyaCounties_SHP)
+```
+
+Inspecting the output:
+
+```{r}
+str(shp)
+```
+
+As expected, we have a dataframe of class `sf`, with a column named `geometry` column, of class `sfc_MULTIPOLYGON`.
+
+We will obtain population counts by county from the same package, and join it to the `shp` data:
+
+```{r}
+pop <- 
+  rKenyaCensus::V3_T2.3 %>% 
+  janitor::clean_names() %>% 
+  filter(sub_county == "ALL", age == "Total") %>% 
+  transmute(
+    county = str_replace_all(county, "[[:punct:]]", " ") %>% str_squish(),
+    total_population = replace_na(total, 0)
+    )
+
+shp <- 
+  shp %>% 
+  select(County) %>% 
+  mutate(County = str_replace_all(County, "[[:punct:]]", " ") %>% str_squish()) %>% 
+  left_join(pop, by = c("County" = "county"))
+```
+
+Before we start mapping, it may be worthwhile to check the Coordinate Reference System (CRS) of your spatial data frame. Coordinate Reference System (CRS) define how the spatial elements of the data relate to the surface of the Earth (or other bodies). The **rKenyaCensus** documentation states that the geometries are in the WGS 84 projection. You can change it, with `st_tranform()` :
+
+```{r}
+shp <- st_transform(shp, crs = 4326)
+```
+
+## Workflow 1: Leaflet
+
+[Leaflet](http://leafletjs.com/) is a very popular open-source JavaScript library for interactive maps. Many websites use it, such as the New York Times, Washington Post, and GIS software like OpenStreetMap, Mapbox and CartoDB. The **leaflet** R package has many helpful features to help make interactive leaflet maps:
+
+-   Interactive panning/zooming
+
+-   Layer many combinations:
+
+    -   Map tiles
+
+    -   Markers
+
+    -   Polygons
+
+    -   Lines
+
+    -   Popups
+
+    -   GeoJSON
+
+-   Never have to leave R/RStudio
+
+-   Easily insert maps in **RMarkdown**, **Shiny** and more
+
+-   Easily render spatial objects from the `sp` or `sf` packages, or data frames with latitude/longitude columns
+
+-   Display maps in non-spherical mercator projections
+
+-   Augment map features using chosen plugins from [leaflet plugins repository](http://leafletjs.com/plugins)
+
+We'll be making a chloropleth of Kenyan county-level populations, that we will embed in a **Shiny** dashboard:
+
+```{r}
+# color palette 
+pal <- 
+  colorBin(
+  palette = "YlOrRd",
+  domain = shp$total_population)
+
+# pop up message
+labels <- 
+  sprintf(
+  "<strong>%s</strong><br/>%g",
+  shp$County, shp$total_population) %>% 
+  lapply(htmltools::HTML)
+
+
+shinyApp(
+ ui <- navbarPage("Leaflet", id="nav", 
+                 
+                 tabPanel(
+                   "Interactive map",
+                   withSpinner(leafletOutput(
+                     outputId = "mymap", 
+                     width = "900px", 
+                     height = "500px"))),
+                 
+                 tabPanel("Explore the data",
+                          DT::dataTableOutput("table"))
+),
+
+  server <- function(input, output) {
+  
+# map panel 
+  output$mymap <- renderLeaflet({
+    
+    # passing the shp df to leaflet
+    leaflet(shp) %>%
+      # zooming in on Kenya 
+      setView(37.9062, 0.0236, 5) %>%
+      # adding tiles, without labels to minimize clutter
+      addProviderTiles("CartoDB.PositronNoLabels") %>%
+      # parameters for the polygons
+      addPolygons(
+        fillColor = ~pal(total_population), 
+        weight = 1,
+        opacity = 1,
+        color = "white",
+        fillOpacity = 0.7,
+        highlight = highlightOptions(
+          weight = 2,
+          color = "#666",
+          fillOpacity = 0.7,
+          bringToFront = TRUE),
+        label = labels,
+        labelOptions = labelOptions(
+          style = list("font-weight" = "normal"),
+          textsize = "15px",
+          direction = "auto")) %>%
+      # legend
+      addLegend(pal = pal,
+            values = shp$total_population,
+            position = "bottomright",
+            title = "Population",
+            opacity = 0.8,
+            na.label = "No data")
+  })
+  
+  # data panel
+  output$table <- DT::renderDataTable({
+    DT::datatable(shp %>% st_drop_geometry(), rownames = F,  filter = 'top',
+                  extensions = c('Buttons', 'FixedHeader', 'Scroller'),
+                  options = list(pageLength = 15, lengthChange = F,
+                                 fixedHeader = TRUE,
+                                 dom = 'lfBrtip',
+                                 list('copy', 'print', list(
+                                   extend = 'collection',
+                                   buttons = c('csv', 'excel', 'pdf'),
+                                   text = 'Download'
+                                 ))
+                  ))
+  })
+  
+}
+
+,
+
+  options = list(height = 700)
+)
+
+```
+
+## Workflow 2: D3
+
+ThedreamRs team developed the **r2d3maps** package, which allows you to create D3 maps. D3 is also a JavaScript library for producing dynamic, interactive data visualizations in web browsers. Like Leaflet, it has the advantages of:
+
+-   Never having to leave R/RStudio
+
+-   Easily insert maps in **RMarkdown**, **Shiny** and more
+
+The disadvantages to this approach compared to **Leaflet** is panning/zooming and layering is not possible *out of the box*. You can however use **r2d3map** to convert your `sf` object to `topojson` and use a custom JavaScript script to do all the customization and layering you'd like, but that involves knowing at least a little JavaScript. 
+
+We'll look at the population farming permanent crops in Kenya.
+
+```{r}
+shp <- st_as_sf(rKenyaCensus::KenyaCounties_SHP)
+
+pop <- 
+  rKenyaCensus::V3_T2.3 %>% 
+  janitor::clean_names() %>% 
+  filter(sub_county == "ALL", age == "Total") %>% 
+  transmute(
+    county = str_replace_all(county, "[[:punct:]]", " ") %>% str_squish(),
+    total_population = replace_na(total, 0)
+  )
+
+shp <- 
+  shp %>% 
+  select(County) %>% 
+  mutate(County = str_replace_all(County, "[[:punct:]]", " ") %>% str_squish()) %>% 
+  left_join(pop, by = c("County" = "county"))
+
+shp <- st_transform(shp, crs = 4326)
+
+crops <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-01-19/crops.csv')
+
+kenya_crops <-
+  crops %>% 
+  filter(SubCounty != "KENYA") %>% 
+  select(-Farming) %>% 
+  mutate(across(where(is.numeric), ~ (.x/1000)),
+         SubCounty = str_replace_all(SubCounty, "[:punct:]", " ")
+  ) %>% 
+  rename(county = SubCounty,
+         Cashew = `Cashew Nut`,
+         Miraa = `Khat (Miraa)`)
+
+shp <- shp %>% left_join(kenya_crops, by = c("County" = "county"))
+```
+
+```{r}
+shinyApp(
+ui <- fluidPage(
+  fluidRow(
+    column(
+      width = 10, offset = 1,
+      tags$h2("Population farming permanent crops in Kenya:"),
+      d3Output(outputId = "mymap", width = "600px", height = "500px"),
+      radioButtons(
+        inputId = "var",
+        label = "Crop:",
+        choices = list(
+          "Tea" = "Tea",
+          "Coffee" = "Coffee",
+          "Avocado" = "Avocado",
+          "Citrus" = "Citrus"
+        ),
+        inline = TRUE)
+      )
+    )
+  ),
+
+server <- function(input, output, session) {
+  
+  output$mymap <- renderD3({
+    d3_map(shape = shp) %>%
+      add_continuous_breaks(var = "Tea") %>%
+      add_tooltip(value = "<b>{County}</b>") %>%
+      add_legend(title = "Population farming Tea", suffix = "K") %>%
+      add_labs(caption = "Data: rKenyaCensus")
+  })
+  
+  title_legend <- list(
+    "Tea" = "Tea",
+    "Coffee" = "Coffee",
+    "Avocado" = "Avocado",
+    "Citrus" = "Citrus"
+  )
+  
+  observeEvent(list(input$var, input$palette), {
+    d3_map_proxy(shinyId = "mymap", data = shp) %>%
+      update_continuous_breaks(var = input$var, palette = input$palette) %>%
+      update_legend(title = sprintf(
+        "Population farming %s", title_legend[[input$var]]
+      ), suffix = "K")
+  }, ignoreInit = TRUE)
+  
+},
+
+options = list(height = 700)
+
+)
+```
+
+## References
+
+[Geocomputation with R](https://geocompr.robinlovelace.net/spatial-class.html)
+
+[sf Package Documentation](https://r-spatial.github.io/sf/)
+
+[Leaflet for R](https://rstudio.github.io/leaflet/)
+
+[D3 maps with R](https://github.com/dreamRs/r2d3maps)
+
+[How to make web-ready US county-level maps](https://asmae-toumi.netlify.app/posts/2020-08-10-how-to-make-web-ready-us-county-level-maps/)
+
+[Avrodriguez \#TidyTuesday submission](https://github.com/avrodrigues/Tidy_tuesday/blob/main/2021/week04/kenya_crops.png)
+
+[Josh Faure \#TidyTuesday submission](https://github.com/jwfaure/tidyTuesday/blob/main/kenya_census/kenya_avo.R)
